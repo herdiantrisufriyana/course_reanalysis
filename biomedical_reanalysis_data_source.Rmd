@@ -1,0 +1,865 @@
+---
+title: "Data sources for biomedical reanalysis study: omics and clinical data"
+author: "Herdiantri Sufriyana"
+output: html_document
+always_allow_html: yes
+---
+
+# Programming environment
+
+```{r Set up programming environment, include=FALSE}
+if(!'renv'%in%rownames(installed.packages())) install.packages('renv')
+
+renv::init(restart=F)
+install.packages('devtools')
+devtools::install_version('BiocManager','1.30.10')
+BiocManager::install(version='3.11',update=T)
+BiocManager::install('tidyverse',version='3.11',update=F)
+BiocManager::install('Biobase',version='3.11',update=F)
+devtools::install_github('herdiantrisufriyana/medhist',upgrade=F)
+BiocManager::install('lubridate',version='3.11',update=F)
+BiocManager::install('readxl',version='3.11',update=F)
+BiocManager::install('GEOquery',version='3.11',update=F)
+BiocManager::install('biomaRt',version='3.11',update=F)
+BiocManager::install('oligo',version='3.11',update=F)
+BiocManager::install('parallelDist',version='3.11',update=F)
+BiocManager::install('WGCNA',version='3.11',update=F)
+BiocManager::install('sva',version='3.11',update=F)
+BiocManager::install('limma',version='3.11',update=F)
+renv::snapshot()
+
+renv::restore()
+
+library(tidyverse)
+library(medhist)
+library(lubridate)
+library(readxl)
+library(Biobase)
+library(GEOquery)
+library(biomaRt)
+library(oligo)
+library(parallelDist)
+library(WGCNA)
+library(sva)
+library(limma)
+
+select=dplyr::select
+rename=dplyr::rename
+summarize=dplyr::summarize
+```
+
+```{r Function to get OR by regression analysis, include=FALSE}
+logistic_OR=function(formula,data){
+  covariates=
+    formula %>%
+    as.character() %>%
+    .[3] %>%
+    str_split(' \\+ ') %>%
+    .[[1]]
+  
+  glm(formula,data=data,family=binomial) %>%
+    broom::tidy() %>%
+    filter(term==covariates[1]) %>%
+    mutate(
+      CI95_lb=estimate-qnorm(0.975)*std.error
+      ,CI95_ub=estimate+qnorm(0.975)*std.error
+    ) %>%
+    select(estimate,CI95_lb,CI95_ub) %>%
+    gather(metric,logit) %>%
+    mutate(estimate=round(exp(logit),2)) %>%
+    select(-logit) %>%
+    spread(metric,estimate) %>%
+    mutate(
+      covariate_of_interest=covariates[1]
+      ,adjusted_by=paste0(covariates[-1],collapse=' + ')
+    ) %>%
+    select(covariate_of_interest,estimate,everything())
+}
+```
+
+```{r Function to downlaod and preprocess annotation, include=FALSE}
+download_annotation=function(the_platform,the_mart){
+  getBM(mart=the_mart,attributes=c(
+      the_platform,
+      'ensembl_gene_id','entrezgene_id','hgnc_symbol'
+    )) %>%
+    apply(2,as.character) %>%
+    apply(2,trimws) %>%
+    apply(2,function(x) gsub('^$|^ $',NA,x)) %>%
+    as.data.frame(stringsAsFactors=FALSE) %>%
+    setNames(c('probe_id','ensembl_gene_id','entrezgene_id','hgnc_symbol')) %>%
+    filter(!(is.na(probe_id))) %>%
+    group_by(probe_id) %>%
+    summarise_all(function(x){
+      ifelse(
+        length(unique(x))>1,
+        paste(unique(x),collapse='///'),
+        x
+      )
+    }) %>%
+    ungroup() %>%
+    filter(
+      !(is.na(ensembl_gene_id)) &
+      !(is.na(entrezgene_id)) &
+      !(is.na(hgnc_symbol))
+    ) %>%
+    filter(
+      !(str_detect(ensembl_gene_id,'///')) &
+      !(str_detect(entrezgene_id,'///')) &
+      !(str_detect(hgnc_symbol,'///'))
+    ) %>%
+    column_to_rownames(var='probe_id')
+}
+```
+
+```{r Function to conduct differential expression analysis, include=FALSE}
+conduct_dea=function(the_eset,abs_logFC=2,adj_pval=0.05){
+  
+  model=list()
+  
+  model$eset=the_eset
+  
+  # Build the model and the null model
+  model$mod=model.matrix(~outcome,data=pData(model$eset))
+  model$mod0=model.matrix(~1,data=pData(model$eset))
+  
+  # Computer surrogate variables
+  model$svobj=sva(exprs(model$eset),model$mod,model$mod0,numSVmethod='leek')
+  
+  # Fit using limma with SV adjustment (removing heterogeneity)
+  model$fit=lmFit(exprs(model$eset),cbind(model$mod,model$svobj$sv))
+  
+  # Compute Bayesian statistics
+  model$eb=eBayes(model$fit)
+
+  # Do multiple testing correction using BH method
+  model$result=topTable(model$eb,coef=2,nrow(model$eset),adjust="BH",sort.by='none')
+
+  # Volcano plot
+  model$vp=model$result  %>%
+    rownames_to_column(var='hgnc_symbol') %>%
+    mutate(
+      deg=ifelse(adj.P.Val<adj_pval,paste0('adj. p-value<',adj_pval),'non-DEG'),
+      deg=factor(deg,levels=c('non-DEG',paste0('adj. p-value<',adj_pval)))
+    ) %>%
+    mutate(
+      minlog_p=-log10(P.Value),
+      minlog_q=-log10(adj.P.Val)
+    ) %>%
+    ggplot(aes(x=logFC,y=minlog_p)) +
+    geom_point(aes(color=deg)) +
+    geom_text(
+      aes(
+        label=ifelse(abs(logFC)>abs_logFC & adj.P.Val<adj_pval,hgnc_symbol,NA),
+        alpha=abs(logFC)*minlog_q,
+        hjust=ifelse(logFC>0,0,1)
+      ),
+      vjust=0,size=2,na.rm=TRUE
+    ) +
+    geom_vline(xintercept=c(-abs_logFC,0,abs_logFC),linetype=3) +
+    scale_x_continuous('logFC') +
+    scale_y_continuous('-log10 p-value') +
+    scale_color_manual('',values=c('#000000','#D55E00')) +
+    scale_alpha(guide='none',range=c(-0.5,1)) +
+    ggtitle(paste0(levels(the_eset$outcome),collapse=' vs. ')) +
+    theme_minimal()
+
+  print(model$vp)
+  
+  model
+}
+```
+
+# BPJS Kesehatan
+
+```{r Call datasets, include=FALSE}
+data('subject')
+data('visit_cap')
+data('visit_ffs')
+data('visit_drg')
+data('diagnosis')
+```
+
+```{r Subject table, echo=FALSE}
+subject
+```
+
+```{r Visit table based on capitation, echo=FALSE}
+visit_cap
+```
+
+```{r Visit table based on FFS, echo=FALSE}
+visit_ffs
+```
+
+```{r Visit table based on DRG, echo=FALSE}
+visit_drg
+```
+
+```{r Diagnosis table, echo=FALSE}
+diagnosis
+```
+
+
+```{r View how many unique code type, echo=FALSE}
+diagnosis %>%
+  select(code_type) %>%
+  filter(!duplicated(.))
+```
+
+```{r Filter only diagnosis and procedure code at discharge, include=FALSE}
+diag=
+  diagnosis %>%
+  filter(str_detect(code_type,'Discharge|Procedure'))
+```
+
+```{r Join diagnosis or procedure to each visit table, include=FALSE}
+cap=
+  visit_cap %>%
+  left_join(diag,by='visit_id') %>%
+  select(subject_id,admission_date,code)
+
+ffs=
+  visit_ffs %>%
+  left_join(diag,by='visit_id') %>%
+  select(subject_id,admission_date,code)
+
+drg=
+  visit_drg %>%
+  left_join(diag,by='visit_id') %>%
+  select(subject_id,admission_date,code)
+```
+
+```{r Join all visit tables, include=FALSE}
+visit_diag=
+  rbind(cap,ffs,drg) %>%
+  filter(!duplicated(.))
+```
+
+```{r Visit table with multiple-row diagnosis, echo=FALSE}
+visit_diag
+```
+
+Find out ICD-10 codes for your variables at:
+https://www.icd10data.com/ICD10CM/Codes
+
+```{r Define codes for outcome and covariates, include=FALSE}
+# Diabetes mellitus
+event='E08|E09|E10|E11|E13'
+
+# Dyslipidemia
+exposure='E78[0-5]'
+
+# Chronic periodontitis
+exposure2='K053'
+```
+
+```{r Table of subjects with event, include=FALSE}
+event_subject=
+  visit_diag %>%
+  filter(str_detect(code,event)) %>%
+  group_by(subject_id) %>%
+  summarize(outcome_date=min(admission_date)) %>%
+  ungroup()
+```
+
+```{r Table of subjects with exposure 1, include=FALSE}
+exposed_subject=
+  visit_diag %>%
+  left_join(event_subject,by='subject_id') %>%
+  filter(admission_date<=outcome_date | is.na(outcome_date)) %>%
+  filter(str_detect(code,exposure)) %>%
+  select(subject_id) %>%
+  filter(!duplicated(.))
+```
+
+```{r Table of subjects with exposure 2, include=FALSE}
+exposed_subject2=
+  visit_diag %>%
+  left_join(event_subject,by='subject_id') %>%
+  filter(admission_date<=outcome_date | is.na(outcome_date)) %>%
+  filter(str_detect(code,exposure2)) %>%
+  select(subject_id) %>%
+  filter(!duplicated(.))
+```
+
+```{r Cohort, include=FALSE}
+cohort=
+  
+  # Use visit-diagnosis table
+  visit_diag %>%
+  
+  # Assign nonevent and event respectively as 0 and 1
+  left_join(event_subject,by='subject_id') %>%
+  mutate(outcome=as.numeric(!is.na(outcome_date))) %>%
+  
+  # Remove visit before outcome date if event
+  filter(admission_date<=outcome_date | is.na(outcome_date)) %>%
+  
+  # Assign nonexposed and exposed respectively as 0 and 1
+  mutate(covariate=as.numeric(subject_id%in%exposed_subject$subject_id)) %>%
+  
+  # Assign nonexposed and exposed respectively as 0 and 1
+  mutate(covariate2=as.numeric(subject_id%in%exposed_subject2$subject_id)) %>%
+  
+  # Get only one subject per row
+  select(subject_id,covariate,covariate2,outcome,outcome_date) %>%
+  filter(!duplicated(.)) %>%
+  
+  # Join other variables of the subjects
+  left_join(subject,by='subject_id') %>%
+  
+  # Compute age and recode sex female and male respectively as 0 and 1
+  mutate(
+    age=
+      ifelse(
+        is.na(outcome_date)
+        ,as.duration(as.Date('2016-12-31')-birth_date)/dyears(1)
+        ,as.duration(outcome_date-birth_date)/dyears(1)
+      )
+    ,sex=as.numeric(sex=='male')
+  ) %>%
+  
+  # Select column of interest
+  select(subject_id,covariate,covariate2,age,sex,outcome) %>%
+  
+  # Exclude subject ID
+  column_to_rownames(var='subject_id')
+```
+
+```{r Summary of cohort, echo=FALSE}
+cohort %>%
+  select(covariate,outcome) %>%
+  table()
+
+cohort %>%
+  select(covariate2,outcome) %>%
+  table()
+```
+
+```{r View cohort, echo=FALSE}
+cohort
+```
+
+```{r Regression analysis, include=FALSE}
+results=
+  list(
+    outcome~covariate
+    ,outcome~covariate+age+sex
+    ,outcome~covariate2
+    ,outcome~covariate2+age+sex
+    ,outcome~covariate+covariate2+age+sex
+    ,outcome~covariate2+covariate+age+sex
+  ) %>%
+  lapply(logistic_OR,data=cohort) %>%
+  do.call(rbind,.)
+```
+
+```{r Plot results, echo=FALSE}
+results %>%
+  ggplot(aes(adjusted_by,estimate)) +
+  geom_hline(yintercept=1,lty=2) +
+  geom_point() +
+  geom_errorbar(aes(ymin=CI95_lb,ymax=CI95_ub),width=0.25) +
+  facet_wrap(~covariate_of_interest) +
+  coord_flip() +
+  theme_light()
+```
+
+# Mendeley data
+
+```{r Load dataset, include=FALSE}
+# https://data.mendeley.com/datasets/wj9rwkp9c2/1
+raw_data=read_xlsx('data/raw_data.xlsx')
+```
+
+```{r Show dataset, echo=FALSE}
+raw_data
+```
+
+```{r Split column by scale, include=FALSE}
+categoric_raw=
+  raw_data %>%
+  .[,sapply(.,class)!='numeric']
+
+numeric_raw=
+  raw_data %>%
+  .[,sapply(.,class)=='numeric']
+```
+
+```{r Show distribution of numeric data, echo=FALSE, fig.height=20, fig.width=5}
+numeric_raw %>%
+  gather() %>%
+  ggplot(aes(value)) +
+  geom_histogram(bins=100) +
+  facet_wrap(~key,scales='free',ncol=1)
+```
+
+```{r Binarize categorical data, include=FALSE}
+categoric_data=
+  categoric_raw %>%
+  unite(id,id,patient_num,sep='') %>%
+  mutate(
+    sex=as.numeric(sex=='M')
+    ,outcome=as.numeric(outcome=='Y')
+  )
+```
+
+```{r Standardize numerical data, include=FALSE}
+numeric_data=
+  numeric_raw %>%
+  mutate_all(scale)
+```
+
+```{r Show distribution of standardized data, echo=FALSE, fig.height=20, fig.width=5}
+ suppressWarnings(gather(numeric_data)) %>%
+  ggplot(aes(value)) +
+  geom_histogram(bins=100) +
+  facet_wrap(~key,scales='free',ncol=1)
+```
+
+```{r Bind all data, include=FALSE}
+proc_data=
+  categoric_data %>%
+  cbind(numeric_data)
+```
+
+```{r Regression analysis 2, include=FALSE}
+results2=
+  list(
+    outcome~cholesterol
+    ,outcome~cholesterol+age+sex+bmi
+    ,outcome~triglyceride
+    ,outcome~triglyceride+age+sex+bmi
+    ,outcome~ldl
+    ,outcome~ldl+age+sex+bmi
+    ,outcome~hdl
+    ,outcome~hdl+age+sex+bmi
+    ,outcome~triglyceride+ldl+hdl+age+sex+bmi
+    ,outcome~ldl+triglyceride+hdl+age+sex+bmi
+    ,outcome~hdl+triglyceride+ldl+age+sex+bmi
+  ) %>%
+  lapply(logistic_OR,data=proc_data) %>%
+  do.call(rbind,.)
+```
+
+```{r Plot results 2, echo=FALSE}
+results2 %>%
+  ggplot(aes(adjusted_by,estimate)) +
+  geom_hline(yintercept=1,lty=2) +
+  geom_point() +
+  geom_errorbar(aes(ymin=CI95_lb,ymax=CI95_ub),width=0.25) +
+  facet_wrap(~covariate_of_interest) +
+  coord_flip() +
+  theme_light()
+```
+
+# GEO Omnibus
+
+```{r Download expression set, include=FALSE}
+# https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE156993
+GSE156993_proc=getGEO('GSE156993',getGPL=F)
+GSE156993_proc=GSE156993_proc$GSE156993_series_matrix.txt.gz
+```
+
+```{r Expression set}
+GSE156993_proc
+```
+
+```{r Phenotype data, echo=FALSE}
+GSE156993_proc %>%
+  pData()
+```
+
+```{r Expression data, echo=FALSE}
+GSE156993_proc %>%
+  exprs() %>%
+  as.data.frame()
+```
+
+```{r Feature or gene probe data}
+GSE156993_proc %>%
+  fData()
+```
+
+```{r Show the expression is already normalized, echo=FALSE}
+GSE156993_proc %>%
+  exprs() %>%
+  boxplot()
+```
+
+Download file and extract to data/GSE156993/raw:
+https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE156993&format=file
+
+```{r Get raw data, include=FALSE}
+GSE156993_raw=
+  list.files('data/GSE156993/raw') %>%
+  data.frame(filename=.) %>%
+  mutate(id=str_split_fixed(filename,'_',2)[,1]) %>%
+  mutate(filename=paste0('data/GSE156993/raw/',filename)) %>%
+  spread(id,filename) %>%
+  unlist() %>%
+  read.celfiles(sampleNames=names(.))
+```
+
+```{r Get unnormalized data, include=FALSE}
+GSE156993_unnorm=
+  GSE156993_raw %>%
+  rma(background=T,normalize=F)
+```
+
+```{r Show the expression before normalized, echo=FALSE}
+GSE156993_unnorm %>%
+  exprs() %>%
+  boxplot()
+```
+
+```{r get normalized_data}
+GSE156993_norm=
+  GSE156993_raw %>%
+  rma(background=T,normalize=T)
+```
+
+```{r Show the expression after normalized, echo=FALSE}
+GSE156993_norm %>%
+  exprs() %>%
+  boxplot()
+```
+
+```{r RLE outliers before normalization, include=FALSE}
+GSE156993_RLE=
+  GSE156993_unnorm %>%
+  exprs() %>%
+  sweep(1,rowMedians(.),'-') %>%
+  as.data.frame() %>%
+  rownames_to_column(var='probe_id') %>%
+  gather(sample_id,RLE,-probe_id) %>%
+  mutate(sample_id=reorder(sample_id,RLE,mean)) %>%
+  left_join(
+    group_by(.,sample_id) %>%
+      summarize(
+        median=quantile(RLE,0.5)
+        ,q1=quantile(RLE,0.25)
+        ,q3=quantile(RLE,0.75)
+      ) %>%
+      ungroup() %>%
+      mutate(
+        minq=q1-1.5*(q3-q1)
+        ,maxq=q3+1.5*(q3-q1)
+      )
+    ,by='sample_id'
+  ) %>%
+  cbind(
+    summarize(
+      .
+      ,all_median=quantile(RLE,0.5)
+      ,all_q1=quantile(RLE,0.25)
+      ,all_q3=quantile(RLE,0.75)
+    ) %>%
+      ungroup() %>%
+      mutate(
+        all_minq=all_q1-1.5*(all_q3-all_q1)
+        ,all_maxq=all_q3+1.5*(all_q3-all_q1)
+      )
+  ) %>%
+  mutate(
+    suspect_outlier=
+      ifelse(
+        median>all_maxq|
+        median<all_minq|
+        maxq>all_maxq|
+        minq<all_minq
+        ,'yes','no'
+      )
+  )
+
+RLE_outliers=
+  GSE156993_RLE %>%
+  filter(suspect_outlier=='yes') %>%
+  pull(sample_id) %>%
+  .[!duplicated(.)] %>%
+  as.character()
+```
+
+```{r Show RLE outliers, echo=FALSE}
+GSE156993_RLE %>%
+  qplot(sample_id,RLE,fill=suspect_outlier,data=.,geom='boxplot',outlier.color=NA) +
+  geom_hline(yintercept=GSE156993_RLE$all_minq[1],lty=2) +
+  geom_hline(yintercept=GSE156993_RLE$all_maxq[1],lty=2) +
+  theme(axis.text.x=element_blank())
+```
+
+```{r Outliers by hierarchical clustering after normalization}
+GSE156993_hclust=
+  GSE156993_norm %>%
+  exprs() %>%
+  t() %>%
+  parallelDist(method='manhattan') %>%
+  hclust(method='complete')
+```
+
+```{r Show heirarchical clustering outliers}
+GSE156993_hclust %>%
+  plot
+GSE156993_hclust %>%
+  rect.hclust(k=3,border=2:4)
+```
+
+```{r Get outliers, include=FALSE}
+GSE156993_outliers=
+  GSE156993_hclust %>%
+  cutree(k=3) %>%
+  .[.%in%c(2,3)] %>%
+  .[names(.) %in% RLE_outliers] %>%
+  names()
+```
+
+```{r Show distribution of medians of gene probes, echo=FALSE}
+GSE156993_norm %>%
+  exprs() %>%
+  rowMedians() %>%
+  hist(100)
+abline(
+  v=quantile(rowMedians(exprs(GSE156993_norm)),0.05)
+  ,col=2
+  ,lwd=3
+)
+```
+
+```{r Get low-expressed gene probes, include=FALSE}
+GSE156993_lowexp=
+  GSE156993_norm %>%
+  rownames() %>%
+  .[rowMedians(exprs(GSE156993_norm))
+    <=
+    quantile(rowMedians(exprs(GSE156993_norm)),0.05)
+  ]
+```
+
+```{r Filter out low-expressed gene probes and outliers, include=FALSE}
+GSE156993_filt=
+  GSE156993_norm %>%
+  .[!rownames(.) %in% GSE156993_lowexp
+    ,!colnames(.) %in% GSE156993_outliers]
+```
+
+```{r Download annotation source from Ensembl for Homo sapiens, include=FALSE}
+mart=useMart('ensembl')
+ensembl=useDataset('hsapiens_gene_ensembl',mart)
+```
+
+```{r Find code to download annotation, echo=FALSE}
+listAttributes(ensembl) %>%
+  mutate(description=str_to_lower(description)) %>%
+  filter(str_detect(description,'affy'))
+```
+
+```{r Download annotation, include=FALSE}
+GSE156993_anno=
+  download_annotation('affy_hg_u133_plus_2',ensembl) %>%
+  .[intersect(rownames(GSE156993_filt),rownames(.)),]
+```
+
+```{r Show annotation, echo=FALSE}
+GSE156993_anno
+```
+
+```{r Filter annotated gene probes, include=FALSE}
+GSE156993_filt_anno=
+  GSE156993_filt %>%
+  .[intersect(rownames(GSE156993_anno),rownames(.)),]
+```
+
+```{r Summarize probe to genes, include=FALSE}
+GSE156993_sum_to_hgnc=
+  collapseRows(
+    datET=exprs(GSE156993_filt_anno),
+    rowID=rownames(GSE156993_filt_anno),
+    rowGroup=GSE156993_anno$hgnc_symbol
+  )
+```
+
+```{r Update annotation by gene, include=FALSE}
+GSE156993_sum_to_hgnc$fData=
+  GSE156993_sum_to_hgnc$group2row %>%
+  as.data.frame() %>%
+  setNames(c('hgnc_symbol','probe_id')) %>%
+  left_join(
+    GSE156993_anno %>%
+      rownames_to_column(var='probe_id')
+    ,by=c('hgnc_symbol','probe_id')
+  ) %>%
+  column_to_rownames(var='hgnc_symbol')
+```
+
+```{r Show annotation by gene}
+GSE156993_sum_to_hgnc$fData
+```
+
+```{r Recode phenotype data, include=FALSE}
+GSE156993_pData=
+  GSE156993_proc %>%
+  pData() %>%
+  rownames_to_column(var='gsm') %>%
+  mutate(
+    outcome=
+      ifelse(
+        str_detect(title,'T2DMpoorly-DL-P')
+        ,'T2DMy_Cn_DLy_Py',title
+      )
+  ) %>%
+  mutate(
+    outcome=
+      ifelse(
+        str_detect(outcome,'T2DMwell-DL-P')
+        ,'T2DMy_Cy_DLy_Py'
+        ,outcome)
+  ) %>%
+  mutate(
+    outcome=
+      ifelse(
+        str_detect(outcome,'DL-P')
+        ,'T2DMn_Cu_DLy_Py'
+        ,outcome
+      )
+  ) %>%
+  mutate(
+    outcome=
+      ifelse(
+        str_detect(outcome,'P, ')
+        ,'T2DMn_Cu_DLn_Py'
+        ,outcome
+      )
+  ) %>%
+  mutate(
+    outcome=
+      ifelse(
+        str_detect(outcome,'H, ')
+        ,'T2DMn_Cu_DLn_Pn'
+        ,outcome
+      )
+  ) %>%
+  select(gsm,outcome,everything()) %>%
+  .[,colnames(.) %>%
+      .[.%in%c('gsm','outcome') | str_detect(.,'\\:ch1')]
+  ] %>%
+  rename_all(function(x)str_remove_all(x,'\\:ch1|\\(|\\)')) %>%
+  rename_all(str_to_lower) %>%
+  rename_all(function(x)str_replace_all(x,'\\s','_')) %>%
+  column_to_rownames(var='gsm')
+```
+
+```{r Show recoded phenotype data}
+GSE156993_pData
+```
+
+```{r Wrap up, include=FALSE}
+GSE156993=
+  ExpressionSet(
+    assayData=
+      GSE156993_sum_to_hgnc$datETcollapsed
+    ,phenoData=
+      GSE156993_pData %>%
+      .[colnames(GSE156993_filt_anno),] %>%
+      AnnotatedDataFrame()
+    ,featureData=
+      GSE156993_sum_to_hgnc$fData %>%
+      AnnotatedDataFrame()
+    ,protocolData=
+      GSE156993_proc %>%
+      .[,colnames(GSE156993_filt_anno)] %>%
+      protocolData()
+    ,experimentData=
+      experimentData(GSE156993_proc)
+    ,annotation=
+      annotation(GSE156993_proc)
+  )
+```
+
+```{r Show re-processed expression set}
+GSE156993
+```
+
+```{r Do grouping, include=FALSE}
+sample_idx=list()
+sample_idx$control=which(GSE156993$outcome=='T2DMn_Cu_DLn_Pn')
+sample_idx$dmp=which(GSE156993$outcome=='T2DMy_Cn_DLy_Py')
+sample_idx$dmw=which(GSE156993$outcome=='T2DMy_Cy_DLy_Py')
+sample_idx$dp=which(GSE156993$outcome=='T2DMn_Cu_DLy_Py')
+sample_idx$p=which(GSE156993$outcome=='T2DMn_Cu_DLn_Py')
+```
+
+```{r DEA poorly-controlled DM versus control, echo=FALSE}
+dmp_control=
+  GSE156993 %>%
+  .[,c(sample_idx$control,sample_idx$dmp)] %>%
+  `phenoData<-`(
+    phenoData(.) %>%
+      pData() %>%
+      mutate(
+        outcome=
+          outcome %>%
+          factor(c('T2DMn_Cu_DLn_Pn','T2DMy_Cn_DLy_Py'))
+      ) %>%
+      AnnotatedDataFrame()
+  ) %>%
+  conduct_dea(abs_logFC=2,adj_pval=0.05)
+```
+
+```{r DEA well-controlled DM versus control, echo=FALSE}
+dmw_control=
+  GSE156993 %>%
+  .[,c(sample_idx$control,sample_idx$dmw)] %>%
+  `phenoData<-`(
+    phenoData(.) %>%
+      pData() %>%
+      mutate(
+        outcome=
+          outcome %>%
+          factor(c('T2DMn_Cu_DLn_Pn','T2DMy_Cy_DLy_Py'))
+      ) %>%
+      AnnotatedDataFrame()
+  ) %>%
+  conduct_dea(abs_logFC=2,adj_pval=0.05)
+```
+
+```{r DEA dyslipidemia-periodontitis versus control, echo=FALSE}
+dp_control=
+  GSE156993 %>%
+  .[,c(sample_idx$control,sample_idx$dp)] %>%
+  `phenoData<-`(
+    phenoData(.) %>%
+      pData() %>%
+      mutate(
+        outcome=
+          outcome %>%
+          factor(c('T2DMn_Cu_DLn_Pn','T2DMn_Cu_DLy_Py'))
+      ) %>%
+      AnnotatedDataFrame()
+  ) %>%
+  conduct_dea(abs_logFC=2,adj_pval=0.05)
+```
+
+```{r DEA periodontitis versus control, echo=FALSE}
+p_control=
+  GSE156993 %>%
+  .[,c(sample_idx$control,sample_idx$p)] %>%
+  `phenoData<-`(
+    phenoData(.) %>%
+      pData() %>%
+      mutate(
+        outcome=
+          outcome %>%
+          factor(c('T2DMn_Cu_DLn_Pn','T2DMn_Cu_DLn_Py'))
+      ) %>%
+      AnnotatedDataFrame()
+  ) %>%
+  conduct_dea(abs_logFC=1,adj_pval=0.01)
+```
+
+
+
+
+
+
+
